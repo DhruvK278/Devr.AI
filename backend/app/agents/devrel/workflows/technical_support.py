@@ -1,280 +1,288 @@
 import logging
+import os
 from typing import Dict, Any, Literal, TypedDict, List
 from functools import partial
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.base import BaseCheckpointSaver
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers.json import JsonOutputParser
-from langchain_core.runnables import Runnable, RunnablePassthrough
-
 from app.agents.state import AgentState
 from app.agents.devrel.github.github_toolkit import GitHubToolkit
 
 logger = logging.getLogger(__name__)
 
 class TechnicalSupportInput(TypedDict):
-    """Define the input schema for the HIL workflow."""
     messages: List[Dict[str, Any]]
 
-def clarify_context_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Node 1: Ask the user for initial context.
-    """
-    logger.info("HIL Workflow: Clarifying Context")
-    hil_message = "I can help with that. To start, are you working in a specific repository, like 'AOSSIE-Org/Devr.AI'?"
+def check_repo_context_node(state: AgentState) -> Dict[str, Any]:
+    existing_repo = state.context.get("target_repo")
+    logger.info(f"HIL Context Check: target_repo={existing_repo}")
+
+    if existing_repo:
+        return {"current_task": "repo_selected"}
     
+    last_msg = state.messages[-1].get("content", "").strip()
+
+    safe_words = ["yes", "y", "no", "n", "ok", "okay", "sure", "cancel", "stop"]
+    if last_msg.lower() in safe_words:
+        msg = "I missed which repository you're referring to. Could you please type the repository name again?"
+        return {
+            "hil_message": msg,
+            "current_task": "awaiting_repo_name",
+            "final_response": msg
+        }
+
+    if "/" in last_msg and len(last_msg.split()) == 1:
+        logger.info(f"HIL: Detected Repo {last_msg}")
+        return {
+            "context": {**state.context, "target_repo": last_msg},
+            "current_task": "indexing_needed",
+            "hil_message": f"Indexing {last_msg}..." # Keep HIL active
+        }
+    
+    if len(last_msg.split()) == 1 and len(last_msg) > 2 and "/" not in last_msg:
+        default_org = os.getenv("GITHUB_ORG", "AOSSIE-Org")
+        full_repo = f"{default_org}/{last_msg}"
+        logger.info(f"HIL: Auto-completed Repo {full_repo}")
+        return {
+            "context": {**state.context, "target_repo": full_repo},
+            "current_task": "indexing_needed",
+            "hil_message": f"Indexing {full_repo}..." # Keep HIL active
+        }
+
+    hil_msg = "To answer code questions, I need to index the repository. Please enter the repository name (e.g., 'Devr.AI' or 'owner/repo')."
     return {
-        "hil_message": hil_message,
-        "current_task": "awaiting_context",
-        "final_response": hil_message # Set the response for the bot
+        "hil_message": hil_msg,
+        "current_task": "awaiting_repo_name",
+        "final_response": hil_msg
     }
 
-def propose_action_node(state: AgentState, llm: ChatGoogleGenerativeAI) -> Dict[str, Any]:
-    """
-    Node 2: Propose a tool to use based on the context.
-    """
+async def index_repo_node(state: AgentState, github_toolkit: GitHubToolkit) -> Dict[str, Any]:
+    target_repo = state.context.get("target_repo")
+    logger.info(f"HIL Workflow: Indexing {target_repo}")
+    
+    try:
+        tool = github_toolkit.get_tool_by_name("falkor_index_tool")
+        result = await tool.arun(target_repo)
+        
+        if "failed" in result.lower() or "error" in result.lower():
+             msg = f"Indexing failed: {result}. Please try checking the repo name."
+             return {
+                 "hil_message": msg,
+                 "current_task": "awaiting_repo_name",
+                 "final_response": msg
+             }
+
+        msg = f"Indexing complete! {result}\nWhat code question can I answer for you?"
+        
+        return {
+            "hil_message": msg,
+            "current_task": "awaiting_context",
+            "final_response": msg,
+            "context": state.context
+        }
+    except Exception as e:
+        return {
+            "hil_message": f"Error indexing {target_repo}: {e}",
+            "current_task": "awaiting_repo_name"
+        }
+
+def format_messages_safely(messages: list) -> str:
+    formatted = []
+    for m in messages:
+        if isinstance(m, dict):
+            role = m.get("role", "unknown")
+            content = m.get("content", "")
+        elif hasattr(m, "content"):
+            role = getattr(m, "type", "unknown")
+            content = m.content
+        else:
+            continue
+            
+        formatted.append(f"{role}: {content}")
+    return "\n".join(formatted)
+
+def propose_action_node(state: AgentState, llm: ChatOpenAI) -> Dict[str, Any]:
     logger.info("HIL Workflow: Proposing Action")
+    
+    last_msg = state.messages[-1]
+    content = last_msg.content if hasattr(last_msg, 'content') else last_msg.get('content', '')
+    last_user_msg = content.lower().strip()
+    
+    if last_user_msg in ["yes", "y", "ok", "do it"] and state.context.get("supervisor_decision"):
+        return {"current_task": "awaiting_action_approval"}
+
+    repo_full = state.context.get("target_repo", "Devr.AI")
+    repo_name = repo_full.split("/")[-1]
+
+    history_str = format_messages_safely(state.messages[-6:])
+    logger.info(f"HIL Prompt Context: {history_str}")
+
+    json_example = """{
+  "action": "falkor_code_graph_tool",
+  "args": "explain authentication logic",
+  "confirmation_message": "I'll check the auth logic. OK?"
+}"""
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", """
-You are a technical support supervisor. The user has provided the following context.
-Your goal is to propose a *single* GitHub tool call to investigate their problem.
-The user is working on a technical issue.
-The available tool is 'github_toolkit'.
-Based on the conversation, decide what file or issue to investigate first.
-Return a JSON object with "action" (tool name) and "args" (tool input string).
+You are a technical lead for the repository '{repo_full}'.
+The user has asked a question. You must query the code graph (FalkorDB) to answer it.
 
-Example:
-{{
-  "action": "github_toolkit",
-  "args": "What is the content of the file 'database_connector.py' in the 'AOSSIE-Org/Devr.AI' repo?"
-}}
+Current State: The repository is INDEXED and ready.
+Your Task: Translate the user's latest question into a natural language query for the tool.
+
+Example Output:
+{json_example}
+
+Return JSON ONLY.
 """),
-        ("human", "Here is the conversation so far:\n{messages_str}")
+        ("human", "Conversation:\n{history_str}")
     ])
     
     parser = JsonOutputParser()
     
-    messages_str = "\n".join(
-        [f"{m['role']}: {m['content']}" for m in state.messages if m.get("content")]
-    )
-    
-    chain = prompt | llm | parser
-    
     try:
-        proposed_action = chain.invoke({"messages_str": messages_str})
-        tool_input = proposed_action.get("args", "run an investigation")
-        hil_message = f"Okay, based on that, I plan to investigate the following: '{tool_input}'. Does that sound like the right first step?"
-
+        chain = prompt | llm | parser
+        res = chain.invoke({
+            "repo_full": repo_full,
+            "history_str": history_str,
+            "json_example": json_example
+        })
+        
+        hil_msg = res.get("confirmation_message", f"Search code for: '{res.get('args')}'?")
+        
         return {
-            "hil_message": hil_message,
-            "current_task": "awaiting_action_approval",
-            "final_response": hil_message,
+            "hil_message": hil_msg,
+            "hil_message": hil_msg,
+            "current_task": "action_approved", # AUTO-APPROVE (Skip User input for now)
+            "final_response": hil_msg + " (Auto-executing...)",
             "context": {
-                **state.context,
-                "supervisor_decision": proposed_action
+                **state.context, 
+                "supervisor_decision": {**res, "action": "falkor_code_graph_tool", "repo_name": repo_name}
             }
         }
     except Exception as e:
-        logger.error(f"HIL Workflow: Error proposing action: {e}", exc_info=True)
+        logger.error(f"PROPOSE ACTION FAILED: {str(e)}", exc_info=True)
         return {
-            "hil_message": "I'm having trouble deciding the next step. Can you please rephrase your problem?",
-            "current_task": "awaiting_context", 
-            "final_response": "I'm having trouble deciding the next step. Can you please rephrase your problem?"
+            "hil_message": "I'm having trouble analyzing your request. Should I just scan the repository overview?",
+            "current_task": "awaiting_action_approval",
+            "context": {**state.context, "supervisor_decision": {"action": "falkor_code_graph_tool", "args": "repository structure overview", "repo_name": repo_name}}
         }
 
+def check_approval_node(state: AgentState) -> Dict[str, Any]:
+    logger.info("HIL Workflow: Checking Approval")
+    last_msg_obj = state.messages[-1]
+    last_msg = ""
+    
+    if isinstance(last_msg_obj, dict):
+        last_msg = last_msg_obj.get("content", "")
+    elif hasattr(last_msg_obj, "content"):
+        last_msg = last_msg_obj.content
+    
+    last_msg = last_msg.strip().lower()
+    
+    if any(x in last_msg for x in ["yes", "y", "ok", "okay", "sure", "do it", "go ahead"]):
+        return {"current_task": "action_approved", "context": state.context}
+    
+    if any(x in last_msg for x in ["no", "stop", "wait", "cancel", "don't"]):
+        return {"hil_message": "Cancelled. What should I do?", "current_task": "awaiting_context", "final_response": "Cancelled."}
+    
+    if len(last_msg.split()) > 3:
+        return {"hil_message": None, "current_task": "awaiting_context"}
+
+    return {"current_task": "action_approved", "context": state.context}
 async def execute_action_node(state: AgentState, github_toolkit: GitHubToolkit) -> Dict[str, Any]:
-    """
-    Node 3: Run the proposed tool. This does NOT pause.
-    """
-    logger.info("HIL Workflow: Executing Action")
-    
-    try:
-        supervisor_decision = state.context.get("supervisor_decision")
-        if not supervisor_decision or supervisor_decision.get("action") != "github_toolkit":
-            raise Exception("No valid action was approved by the user.")
-            
-        tool_input = supervisor_decision.get("args", "No input provided")
-        logger.info(f"HIL Workflow: Executing tool with input: {tool_input}")
-        agent_executor = github_toolkit.as_executor()
+    decision = state.context.get("supervisor_decision", {})
+    action_name = decision.get("action", "falkor_code_graph_tool")
+    if action_name == "technical_support":
+        action_name = "falkor_code_graph_tool"
         
-        github_chain = (
-            RunnablePassthrough()
-            | (lambda x: x.get("input"))
-            | agent_executor
-        )
-        
-        tool_result_raw = await github_chain.ainvoke({"input": tool_input})
-        tool_message = tool_result_raw.get("output", "Tool executed but provided no output.")
+    tool = github_toolkit.get_tool_by_name(action_name)
+    
+    repo_name = decision.get("repo_name", "Devr.AI")
+    args = decision.get("args")
 
-        tool_result = {
-            "task_result": {
-                "type": "github_toolkit",
-                "status": "success",
-                "message": tool_message
-            }
-        }
+    if not args:
+        return {"task_result": {"message": "Error: No query arguments found. Please ask your question again."}, "current_task": "action_executed"}
 
-        return {
-            "task_result": tool_result["task_result"],
-            "current_task": "action_executed"
-        }
-    except Exception as e:
-        logger.error(f"HIL Workflow: Error executing action: {e}", exc_info=True)
-        return {
-            "task_result": {
-                "type": "github_toolkit",
-                "status": "error",
-                "message": f"Sorry, I ran into an error trying to run that tool: {e}"
-            },
-            "current_task": "action_executed"
-        }
+    tool_input = args
+    if isinstance(args, str):
+        tool_input = {"query": args, "repo_name": repo_name}
+    elif isinstance(args, dict):
+        tool_input = {**args, "repo_name": repo_name}
 
-def present_options_node(state: AgentState, llm: ChatGoogleGenerativeAI) -> Dict[str, Any]:
-    """
-    Node 4: Present options to the user based on tool results.
-    """
-    logger.info("HIL Workflow: Presenting Options")
-    
-    tool_message = state.task_result.get("message", "I found some information, but I'm not sure what to make of it.")
-    
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """
-You are a helpful technical support assistant.
-You will be given the result of a tool you just ran.
-Summarize this result for the user and ask them what they'd like to do next (e.g., "Which part should we investigate first?" or "Does this information help?").
-Keep your response conversational and clear.
-"""),
-        ("human", "Here is the tool result:\n{tool_result}")
-    ])
-    
-    chain = prompt | llm
-    
     try:
-        hil_response = chain.invoke({"tool_result": tool_message})
-        hil_message = hil_response.content
+        result = await tool.arun(tool_input)
+        return {"task_result": {"message": result}, "current_task": "action_executed"}
     except Exception as e:
-        logger.error(f"HIL Workflow: Error in present_options_node: {e}", exc_info=True)
-        hil_message = f"The tool returned: {tool_message}\nWhat would you like to do next?"
+        logger.error(f"Tool Execution Failed: {e}")
+        return {"task_result": {"message": f"Tool Error: {e}"}, "current_task": "action_executed"}
 
+def present_options_node(state: AgentState, llm: ChatOpenAI) -> Dict[str, Any]:
+    msg = state.task_result.get("message", "")
+    res = (ChatPromptTemplate.from_messages([("system", "Summarize results concisely:"), ("human", "{res}")]) | llm).invoke({"res": msg})
+    
+    final_msg = f"{res.content}\n\nWhat else would you like to know about this repository?"
     return {
-        "hil_message": hil_message,
-        "current_task": "awaiting_option_choice",
-        "final_response": hil_message
+        "hil_message": final_msg,
+        "current_task": "awaiting_context",
+        "final_response": final_msg
     }
 
 def wait_for_user_input_node(state: AgentState) -> Dict[str, Any]:
-    """
-    This node is the destination *after* a pause.
-    """
-    logger.info(f"HIL Workflow: Resuming from pause. Messages: {len(state.messages)}")
-    return {
-        "hil_message": None,
-        "waiting_for_human_input": False
-    }
+    return {"waiting_for_human_input": False}
 
-def smart_entry_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Smart entry point that detects if we're resuming or starting fresh.
-    """
-    is_resuming = (
-        state.current_task and 
-        state.current_task != "None" and
-        len(state.messages) > 1
-    )
-    
-    if is_resuming:
-        logger.info(f"HIL Workflow: Resuming - task={state.current_task}, messages={len(state.messages)}")
-    else:
-        logger.info("HIL Workflow: Starting fresh - going to clarify_context")
-    
-    return {}
+def smart_entry_node(state: AgentState) -> Dict[str, Any]: return {}
+def pause_marker_node(state: AgentState) -> Dict[str, Any]: return {}
 
-def pause_marker_node(state: AgentState) -> Dict[str, Any]:
-    """
-    A no-op node used purely as an interrupt target.
-    """
-    logger.info("HIL Workflow: Pause marker reached")
-    return {}
-
-def resume_router(state: AgentState) -> Literal["propose_action", "execute_action", "propose_action_loop", "__end__"]:
-    """
-    This router directs the flow *after* the user provides input.
-    """
-    task = state.current_task
-    logger.info(f"HIL Workflow: Resuming. Last task was: {task}")
-    
-    if task == "awaiting_context":
-        return "propose_action"
-    if task == "awaiting_action_approval":
-        return "execute_action"
-    if task == "awaiting_option_choice":
-        return "propose_action_loop"
-    
-    return "__end__"
-
-def create_technical_support_workflow(
-    llm: ChatGoogleGenerativeAI, 
-    github_toolkit: GitHubToolkit, 
-    checkpointer: BaseCheckpointSaver
-) -> StateGraph:
-    """
-    Factory function to create the HIL workflow graph.
-    """
-    
+def create_technical_support_workflow(llm, github_toolkit, checkpointer) -> StateGraph:
     workflow = StateGraph(AgentState, TechnicalSupportInput)
 
     workflow.add_node("smart_entry", smart_entry_node)
-    workflow.add_node("clarify_context", clarify_context_node)
+    workflow.add_node("check_repo", check_repo_context_node)
+    workflow.add_node("index_repo", partial(index_repo_node, github_toolkit=github_toolkit))
     workflow.add_node("propose_action", partial(propose_action_node, llm=llm))
+    workflow.add_node("check_approval", check_approval_node)
     workflow.add_node("execute_action", partial(execute_action_node, github_toolkit=github_toolkit))
     workflow.add_node("present_options", partial(present_options_node, llm=llm))
     workflow.add_node("pause_here", pause_marker_node)
     workflow.add_node("wait_for_user", wait_for_user_input_node)
 
     workflow.set_entry_point("smart_entry")
-    
-    def smart_entry_router(state: AgentState) -> Literal["wait_for_user", "clarify_context"]:
-        """Route based on whether we're resuming or starting fresh"""
-        try:
-            is_resuming = (
-                state.current_task and 
-                state.current_task != "None" and
-                len(state.messages) > 1
-            )
-            return "wait_for_user" if is_resuming else "clarify_context"
-        except Exception:
-            return "clarify_context"
-    
-    workflow.add_conditional_edges(
-        "smart_entry",
-        smart_entry_router,
-        {
-            "wait_for_user": "wait_for_user",
-            "clarify_context": "clarify_context"
-        }
+
+    # Entry
+    workflow.add_conditional_edges("smart_entry", 
+        lambda s: "wait_for_user" if (s.current_task and s.current_task != "None" and len(s.messages) > 1) else "check_repo", 
+        ["wait_for_user", "check_repo"]
     )
 
-    workflow.add_edge("clarify_context", "pause_here")
-    workflow.add_edge("pause_here", "wait_for_user")
+    # Repo Logic
+    def repo_router(state):
+        if state.current_task == "awaiting_repo_name": return "pause_here"
+        if state.current_task == "indexing_needed": return "index_repo"
+        return "propose_action"
+    workflow.add_conditional_edges("check_repo", repo_router, ["pause_here", "index_repo", "propose_action"])
     
-    workflow.add_conditional_edges(
-        "wait_for_user",
-        lambda state: resume_router(state),
-        {
-            "propose_action": "propose_action",
-            "execute_action": "execute_action",
-            "propose_action_loop": "propose_action",
-            "__end__": END
-        }
-    )
-    
+    workflow.add_edge("index_repo", "pause_here")
     workflow.add_edge("propose_action", "pause_here")
+
+    def resume_router(state):
+        t = state.current_task
+        if t == "awaiting_repo_name": return "check_repo"
+        if t == "awaiting_context": return "propose_action"
+        if t == "awaiting_action_approval": return "check_approval"
+        if t == "action_approved": return "execute_action" # <--- Added for auto-approval
+        return END
+
+    workflow.add_conditional_edges("wait_for_user", resume_router, ["check_repo", "propose_action", "check_approval", "execute_action", END])
+    
+    workflow.add_conditional_edges("check_approval", 
+        lambda s: "execute_action" if s.current_task == "action_approved" else "propose_action",
+        ["execute_action", "propose_action"]
+    )
+
     workflow.add_edge("execute_action", "present_options")
     workflow.add_edge("present_options", "pause_here")
 
-    return workflow.compile(
-        checkpointer=checkpointer,
-        interrupt_before=["pause_here"]
-    )
+    return workflow.compile(checkpointer=checkpointer, interrupt_before=["pause_here"])

@@ -2,7 +2,7 @@ import logging
 from typing import Dict, Any, Literal
 from functools import partial
 from langgraph.graph import StateGraph, END
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
 from ..base_agent import BaseAgent, AgentState
 from .tools.search_tool.ddg import DuckDuckGoSearchTool
@@ -21,14 +21,22 @@ logger = logging.getLogger(__name__)
 
 def check_hil_router(state: AgentState) -> Literal["technical_support", "react_supervisor"]:
     """
-    If a HIL message is set, the graph is paused and waiting for this
-    input. Route directly back to the HIL node to resume.
-    
-    Otherwise, proceed to the main supervisor.
+    Route to HIL if active, otherwise Supervisor.
     """
     if state.hil_message:
         logger.info(f"HIL session active (hil_message found). Routing to technical_support.")
         return "technical_support"
+    
+    task = state.current_task
+    if task in ["awaiting_context", "repo_selected", "indexing_needed", "action_executed", "awaiting_action_approval", "awaiting_repo_name", "action_approved"]:
+        logger.info(f"HIL session sticky (task={task}). Routing to technical_support.")
+        return "technical_support"
+        
+    if state.context.get("target_repo") and len(state.messages) > 0:
+        last_msg = state.messages[-1].get("content", "").lower()
+        if any(w in last_msg for w in ["file", "code", "function", "class", "how", "where", "what"]):
+             logger.info(f"HIL sticky context (target_repo set). Routing to technical_support.")
+             return "technical_support"
     
     logger.info(f"No HIL session active. Routing to react_supervisor.")
     return "react_supervisor"
@@ -38,10 +46,11 @@ class DevRelAgent(BaseAgent):
 
     def __init__(self, config: Dict[str, Any] = None):
         self.config = config or {}
-        self.llm = ChatGoogleGenerativeAI(
+        self.llm = ChatOpenAI(
             model=settings.devrel_agent_model,
             temperature=0.3,
-            google_api_key=settings.gemini_api_key
+            api_key=settings.openrouter_api_key,
+            base_url="https://openrouter.ai/api/v1"
         )
         self.search_tool = DuckDuckGoSearchTool()
         self.faq_tool = FAQTool()
@@ -107,11 +116,19 @@ class DevRelAgent(BaseAgent):
         for tool in ["web_search_tool", "faq_handler_tool", "onboarding_tool", "github_toolkit_tool"]:
             workflow.add_edge(tool, "react_supervisor")
             
+        def route_technical_support_output(state):
+            if state.current_task == "technical_support_complete":
+                return "check_summarization"
+            if state.current_task == "action_approved":
+                return "continue_hil"
+            return "__end__"
+
         workflow.add_conditional_edges(
             "technical_support",
-            lambda state: "check_summarization" if state.current_task == "technical_support_complete" else END,
+            route_technical_support_output,
             {
                 "check_summarization": "check_summarization",
+                "continue_hil": "technical_support",
                 "__end__": END
             }
         )

@@ -53,7 +53,7 @@ async def gather_context_node(state: AgentState) -> Dict[str, Any]:
 
     context_data = {
         "user_profile": profile_data or {"user_id": state.user_id, "platform": state.platform},
-        "conversation_context": len(state.messages) + 1
+        "conversation_context": len(state.messages) + 1,
         "session_info": {"session_id": state.session_id},
         "user_uuid": user_uuid
     }

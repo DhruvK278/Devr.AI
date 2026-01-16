@@ -15,8 +15,12 @@ from api.llm import ask
 from api.project import Project
 from .auto_complete import prefix_search
 
-# Load environment variables from .env file
-load_dotenv()
+env_path = Path(__file__).resolve().parents[5] / '.env'
+if env_path.exists():
+    load_dotenv(dotenv_path=env_path)
+else:
+    load_dotenv()
+    logging.warning(f"Could not find .env at {env_path}, falling back to default lookup.")
 
 # Configure the logger
 logging.basicConfig(level=logging.DEBUG,
