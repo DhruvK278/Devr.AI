@@ -75,6 +75,9 @@ def graph_entities():
         logging.error("Missing 'repo' parameter in request.")
         return jsonify({"status": "Missing 'repo' parameter"}), 400
 
+    if '/' in repo:
+        repo = repo.split('/')[-1]
+
     if not graph_exists(repo):
         logging.error("Missing project %s", repo)
         return jsonify({"status": f"Missing project {repo}"}), 400
@@ -320,6 +323,12 @@ def chat():
     if repo is None:
         return jsonify({'status': 'Missing mandatory parameter "repo"'}), 400
 
+    if '/' in repo:
+        repo = repo.split('/')[-1]
+
+    logging.info(f"Chat request for normalized repo: '{repo}'")
+    print(f"DEBUG: Chat request for normalized repo: '{repo}'")
+
     # Get optional 'label' and 'relation' parameters
     msg = data.get('msg')
     if msg is None:
@@ -401,7 +410,6 @@ def analyze_repo():
     Returns:
         JSON response with processing status
     """
-
     data = request.get_json()
     url = data.get('repo_url')
     if url is None:
@@ -412,7 +420,7 @@ def analyze_repo():
 
     proj = Project.from_git_repository(url)
     proj.analyze_sources(ignore)
-    proj.process_git_history(ignore)
+    # proj.process_git_history(ignore)
 
     stats = proj.graph.stats()
 

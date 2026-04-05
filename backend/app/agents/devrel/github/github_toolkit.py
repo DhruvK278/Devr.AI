@@ -50,7 +50,6 @@ class GitHubToolkit:
             "FalkorIndexTool"
         ]
 
-        # FIX: Register BOTH tools here so HIL can find them
         self.tool_instances: List[BaseTool] = [
             FalkorCodeGraphTool(),
             FalkorIndexTool() 
@@ -131,7 +130,6 @@ class GitHubToolkit:
                 result = await handle_github_supp(query, org=org)
                 result["org_used"] = org
             elif classification == "repo_support":
-                # Original behavior maintained as requested
                 result = await handle_repo_support(query)
             elif classification == "issue_creation":
                 result = "Not implemented"
@@ -145,7 +143,6 @@ class GitHubToolkit:
             else:
                 result = await handle_general_github_help(query, self.llm)
 
-            # Ensure result is returnable (dict or string)
             if isinstance(result, dict):
                 result["intent_analysis"] = intent_result
                 result["type"] = "github_toolkit"

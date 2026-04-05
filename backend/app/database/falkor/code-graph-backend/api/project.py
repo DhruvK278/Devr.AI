@@ -23,7 +23,8 @@ def on_rm_error(func, path, exc_info):
 
 def _clone_source(url: str, name: str) -> Path:
     # path to local repositories
-    path = Path.cwd() / "repositories" / name
+    repo_dir = os.environ.get("CODE_GRAPH_STORAGE_PATH", ".repositories")
+    path = Path.cwd() / repo_dir / name
     print(f"Cloning repository to: {path}")
 
     # Delete local repository if exists
